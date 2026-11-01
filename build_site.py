@@ -1,17 +1,17 @@
-from http.cookiejar import CookieJar
 from html.parser import HTMLParser
-from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlencode, urljoin
-from urllib.request import HTTPCookieProcessor, Request, build_opener
-from zipfile import ZipFile
+from zipfile import ZipFile, is_zipfile
 import shutil
+import subprocess
 
 SOURCE_URL = (
     "https://drive.usercontent.google.com/download"
     "?id=1umW35rNBjePIV5oN2Pf7Jukv9SCxKR7B&export=download"
 )
 OUTPUT = Path("public")
+DOWNLOAD = Path("site-source-download.zip")
+COOKIE_JAR = Path("site-source-cookies.txt")
 
 
 class DownloadFormParser(HTMLParser):
@@ -37,31 +37,44 @@ class DownloadFormParser(HTMLParser):
             self.in_download_form = False
 
 
-def request_bytes(opener, url):
-    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with opener.open(request, timeout=180) as response:
-        return response.read(), response.headers.get_content_type()
+def curl_download(url, output, use_cookies=False):
+    command = [
+        "curl",
+        "-L",
+        "--fail",
+        "--retry",
+        "5",
+        "--retry-all-errors",
+        "--user-agent",
+        "Mozilla/5.0",
+        "--output",
+        str(output),
+    ]
+    if use_cookies:
+        command.extend(["--cookie", str(COOKIE_JAR)])
+    else:
+        command.extend(["--cookie-jar", str(COOKIE_JAR)])
+    command.append(url)
+    subprocess.run(command, check=True)
 
 
-opener = build_opener(HTTPCookieProcessor(CookieJar()))
-payload, content_type = request_bytes(opener, SOURCE_URL)
-
-if content_type == "text/html":
+curl_download(SOURCE_URL, DOWNLOAD)
+if not is_zipfile(DOWNLOAD):
     parser = DownloadFormParser()
-    parser.feed(payload.decode("utf-8", errors="replace"))
+    parser.feed(DOWNLOAD.read_text(encoding="utf-8", errors="replace"))
     if not parser.action or not parser.values:
         raise RuntimeError("Google Drive confirmation form was not found.")
     confirmed_url = urljoin(SOURCE_URL, parser.action) + "?" + urlencode(parser.values)
-    payload, content_type = request_bytes(opener, confirmed_url)
+    curl_download(confirmed_url, DOWNLOAD, use_cookies=True)
 
-if not payload.startswith(b"PK"):
-    raise RuntimeError(f"Expected a ZIP file, received {content_type!r}.")
+if not is_zipfile(DOWNLOAD):
+    raise RuntimeError("Google Drive did not return the expected ZIP file.")
 
 if OUTPUT.exists():
     shutil.rmtree(OUTPUT)
 OUTPUT.mkdir(parents=True)
 
-with ZipFile(BytesIO(payload)) as archive:
+with ZipFile(DOWNLOAD) as archive:
     output_root = OUTPUT.resolve()
     for member in archive.infolist():
         destination = (OUTPUT / member.filename).resolve()
@@ -80,4 +93,7 @@ missing = [str(path) for path in required if not path.exists()]
 if missing:
     raise RuntimeError(f"Missing website files after extraction: {missing}")
 
+DOWNLOAD.unlink(missing_ok=True)
+COOKIE_JAR.unlink(missing_ok=True)
 print(f"Prepared {sum(1 for path in OUTPUT.rglob('*') if path.is_file())} website files.")
+
